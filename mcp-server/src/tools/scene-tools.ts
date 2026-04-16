@@ -124,7 +124,7 @@ export const sceneTools: ToolDefinition[] = [
         value: {
           oneOf: [
             { type: 'object' },
-            { type: 'array' },
+            { type: 'array', items: {} },
             { type: 'string' },
             { type: 'number' },
             { type: 'boolean' }

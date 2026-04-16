@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.4] - 2026-04-16
+
+### Fixed
+- **`modify_node_property` schema missing `items` on array type** — the `value` parameter's `oneOf` included `{ type: 'array' }` without the `items` field required by strict JSON Schema validators, causing the tool to fail to register in clients like GitHub Copilot ([#44](https://github.com/tomyud1/godot-mcp/issues/44))
+
 ## [0.4.3] - 2026-04-14
 
 ### Added
