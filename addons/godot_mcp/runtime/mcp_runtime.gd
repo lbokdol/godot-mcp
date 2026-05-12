@@ -1684,10 +1684,14 @@ func _alg_ssim(a: Image, b: Image, mask: Image) -> float:
 			if not _block_unmasked(mask, x0, y0, SSIM_BLOCK): continue
 			var stats_a := _block_luma_stats(a, x0, y0)
 			var stats_b := _block_luma_stats(b, x0, y0)
-			var cov := _block_luma_cov(a, b, x0, y0, stats_a.mean, stats_b.mean)
-			var num := (2.0 * stats_a.mean * stats_b.mean + SSIM_C1) * (2.0 * cov + SSIM_C2)
-			var den := (stats_a.mean * stats_a.mean + stats_b.mean * stats_b.mean + SSIM_C1) \
-					 * (stats_a.var_ + stats_b.var_ + SSIM_C2)
+			var mean_a: float = float(stats_a["mean"])
+			var mean_b: float = float(stats_b["mean"])
+			var var_a: float = float(stats_a["var_"])
+			var var_b: float = float(stats_b["var_"])
+			var cov := _block_luma_cov(a, b, x0, y0, mean_a, mean_b)
+			var num: float = (2.0 * mean_a * mean_b + SSIM_C1) * (2.0 * cov + SSIM_C2)
+			var den: float = (mean_a * mean_a + mean_b * mean_b + SSIM_C1) \
+					* (var_a + var_b + SSIM_C2)
 			if den == 0.0: continue
 			sum_ssim += num / den
 			counted += 1

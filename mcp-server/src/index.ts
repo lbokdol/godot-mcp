@@ -154,14 +154,25 @@ async function executeToolCall(
     );
   }
 
-  if (!godotBridge!.isConnected()) {
+  // For runtime-only tools the editor connection is not required — only the
+  // in-game MCPRuntime autoload (role=runtime) needs to be live. For every
+  // other tool we still gate on the editor.
+  const routeRuntime = godotBridge!.routeIsRuntime(name, toolArgs);
+  const editorOk     = godotBridge!.isConnected();
+  const runtimeOk    = godotBridge!.isRuntimeConnected();
+  const slotMissing  = (routeRuntime && !runtimeOk) || (!routeRuntime && !editorOk);
+  if (slotMissing) {
+    const which = routeRuntime ? 'runtime helper' : 'editor';
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
-          error: 'Godot editor is not connected',
+          error: `Godot ${which} is not connected`,
           tool: name,
-          hint: `Open a Godot project with the MCP plugin enabled. The plugin will auto-connect to this server on port ${WEBSOCKET_PORT}.`
+          routed_to: routeRuntime ? 'runtime' : 'editor',
+          hint: routeRuntime
+            ? `Tool '${name}' needs the in-game MCPRuntime autoload. Run the game (run_scene with wait_for_runtime=true, or launch with the godot_mcp plugin enabled).`
+            : `Open a Godot project with the MCP plugin enabled. The plugin will auto-connect to this server on port ${WEBSOCKET_PORT}.`,
         }, null, 2)
       }],
       isError: true
