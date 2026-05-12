@@ -26,11 +26,41 @@ const PING_INTERVAL = 10000;
 
 // Tools that are ALWAYS handled by the runtime helper (the in-game autoload).
 // list_signal_connections is conditionally routed (see routeIsRuntime()).
+//
+// Phase 1 runtime catalog (godot_ai_test_planning.md §7) appends:
+//   §7.2 list_actions/press_action/hold_action/release_action
+//   §7.3 click_node/find_and_click
+//   §7.4 press_key/hold_key/release_key/click_at/mouse_move/drag
+//   §7.5 run_input_sequence
+//   §7.6 release_all/get_input_state
+//   §7.7 capture_screenshot/get_runtime_scene_tree/get_node_property
+//   §7.8 assert_property/assert_node_exists/assert_node_visible/assert_no_errors_in_log
+//   §7.9 get_debug_log/clear_debug_log/get_print_log
+//   §7.10 set_node_property/call_node_method/add_node_runtime
 export const RUNTIME_ONLY_TOOLS = new Set<string>([
+  // Legacy v0.5 names (kept for back-compat with existing agent recipes).
   'take_screenshot',
   'send_input',
   'query_runtime_node',
   'get_runtime_log',
+  // Plan §7.2
+  'list_actions', 'press_action', 'hold_action', 'release_action',
+  // §7.3
+  'click_node', 'find_and_click',
+  // §7.4
+  'press_key', 'hold_key', 'release_key', 'click_at', 'mouse_move', 'drag',
+  // §7.5
+  'run_input_sequence',
+  // §7.6
+  'release_all', 'get_input_state',
+  // §7.7
+  'capture_screenshot', 'get_runtime_scene_tree', 'get_node_property',
+  // §7.8
+  'assert_property', 'assert_node_exists', 'assert_node_visible', 'assert_no_errors_in_log',
+  // §7.9
+  'get_debug_log', 'clear_debug_log', 'get_print_log',
+  // §7.10
+  'set_node_property', 'call_node_method', 'add_node_runtime',
 ]);
 
 interface PendingRequest {
