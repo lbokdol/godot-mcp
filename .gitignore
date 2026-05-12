@@ -26,3 +26,7 @@ dist/
 
 # Cursor
 .cursor/
+
+# Runtime cache — populated by MCPRuntime autoload at test time
+# (snapshots, baselines, screenshots, packed scenes). Not part of the plugin.
+addons/godot_mcp/cache/
