@@ -29,6 +29,7 @@ const SERVER_URL := "ws://127.0.0.1:6505"
 const CACHE_SCREENSHOT_DIR := "res://addons/godot_mcp/cache/screenshots/"
 const CACHE_SNAPSHOT_DIR := "res://addons/godot_mcp/cache/snapshots/"
 const CACHE_BASELINE_DIR := "res://addons/godot_mcp/cache/baseline/"
+const CACHE_SCENE_DIR := "res://addons/godot_mcp/cache/scenes/"
 const LOG_RING_CAPACITY := 500
 const PRINT_RING_CAPACITY := 500
 const ERROR_RING_CAPACITY := 500
@@ -199,6 +200,19 @@ func _dispatch(tool_name: String, args: Dictionary) -> Dictionary:
 		"list_baselines":           return _list_baselines(args)
 		"delete_baseline":          return _delete_baseline(args)
 		"compare_screenshots_adhoc": return _compare_screenshots_adhoc(args)
+		# Phase 1.5 — Deterministic mode
+		"enable_deterministic_mode":  return _enable_deterministic_mode(args)
+		"disable_deterministic_mode": return _disable_deterministic_mode(args)
+		"get_deterministic_state":    return _get_deterministic_state(args)
+		"step_frames":                return await _step_frames(args)
+		"set_test_seed":              return _set_test_seed(args)
+		"wait_until":                 return await _wait_until(args)
+		# Phase 2.5 — PackedScene snapshots + AI vision diff
+		"snapshot_scene_full":        return _snapshot_scene_full(args)
+		"snapshot_scene_load":        return _snapshot_scene_load(args)
+		"snapshot_scene_list":        return _snapshot_scene_list(args)
+		"snapshot_scene_delete":      return _snapshot_scene_delete(args)
+		"compare_with_ai":            return await _compare_with_ai(args)
 		_:
 			return {"ok": false, "error": "Unknown runtime tool: %s" % tool_name}
 
@@ -1836,6 +1850,401 @@ func _file_sha256(abs_path: String) -> String:
 		if chunk.size() > 0: h.update(chunk)
 	f.close()
 	return h.finish().hex_encode()
+
+
+# =============================================================================
+# Phase 1.5 — Deterministic mode
+# =============================================================================
+# Tier 0  Off (default)
+# Tier 1  Soft     — seed lock + fps lock + ignore real OS input. ~60% repeat.
+# Tier 2  Stepped — Engine.time_scale = 0 + manual step_frames. ~95% repeat.
+# Tier 3 (Hooked) is plan §9 future work — requires user-script hooks.
+#
+# Side effects (must be documented for callers — agent description text):
+#   * Tier 2 freezes AnimationPlayer / Tween / Timer(process_callback).
+#   * Audio engine runs on its own thread → unaffected by time_scale.
+#   * Time.get_ticks_msec() stays real-time. Game code that depends on it
+#     for gameplay timing will drift under Tier 2.
+#   * If physics_ticks_per_second ≠ max_fps, prefer step_frames(type="both").
+
+var _det_tier: int = 0
+var _det_seed: int = 0
+var _det_fps_saved: int = 0
+var _det_phys_saved: int = 0
+var _det_time_scale_saved: float = 1.0
+var _det_frame_counter: int = 0
+var _det_capture_input: bool = false  # When true, _unhandled_input swallows OS input.
+
+
+func _enable_deterministic_mode(args: Dictionary) -> Dictionary:
+	var tier: int = clampi(int(args.get("tier", 2)), 0, 2)
+	var seed_value: int = int(args.get("seed", 1234))
+	var fps: int = int(args.get("fps", 60))
+	if _det_tier != 0:
+		# Soft re-enable: tear down previous state first so transitions stay clean.
+		_restore_engine_state()
+	_det_tier = tier
+	_det_seed = seed_value
+	_det_frame_counter = 0
+
+	if tier >= 1:
+		seed(seed_value)
+		_det_fps_saved = Engine.max_fps
+		_det_phys_saved = Engine.physics_ticks_per_second
+		Engine.max_fps = fps
+		Engine.physics_ticks_per_second = fps
+		_det_capture_input = true
+	if tier >= 2:
+		_det_time_scale_saved = Engine.time_scale
+		Engine.time_scale = 0.0
+	push_runtime_log("info", "Deterministic tier=%d seed=%d fps=%d" % [tier, seed_value, fps])
+	return {
+		"ok": true, "tier": tier, "seed": seed_value, "fps": fps,
+		"side_effects": _det_side_effects(tier),
+	}
+
+
+func _disable_deterministic_mode(_args: Dictionary) -> Dictionary:
+	var was := _det_tier
+	_restore_engine_state()
+	push_runtime_log("info", "Deterministic disabled (was tier=%d)" % was)
+	return {"ok": true, "was_tier": was}
+
+
+func _restore_engine_state() -> void:
+	if _det_tier >= 2:
+		Engine.time_scale = _det_time_scale_saved
+	if _det_tier >= 1:
+		Engine.max_fps = _det_fps_saved
+		Engine.physics_ticks_per_second = _det_phys_saved
+	_det_tier = 0
+	_det_capture_input = false
+
+
+func _get_deterministic_state(_args: Dictionary) -> Dictionary:
+	return {
+		"ok": true,
+		"tier": _det_tier,
+		"seed": _det_seed,
+		"frame_counter": _det_frame_counter,
+		"fps": Engine.max_fps,
+		"physics_ticks_per_second": Engine.physics_ticks_per_second,
+		"time_scale": Engine.time_scale,
+		"capture_input": _det_capture_input,
+	}
+
+
+func _step_frames(args: Dictionary) -> Dictionary:
+	var n: int = clampi(int(args.get("n", 1)), 1, 100000)
+	var kind: String = str(args.get("type", "both"))
+	if _det_tier < 2:
+		return {"ok": false, "code": "MODE_CONFLICT",
+				"error": "step_frames requires Tier 2 (Stepped). Current tier=%d. Call enable_deterministic_mode(tier=2) first." % _det_tier,
+				"suggestions": ["enable_deterministic_mode"]}
+	var saved := Engine.time_scale
+	Engine.time_scale = 1.0
+	for i in n:
+		match kind:
+			"process":  await get_tree().process_frame
+			"physics":  await get_tree().physics_frame
+			"both", _:
+				await get_tree().process_frame
+				await get_tree().physics_frame
+	Engine.time_scale = 0.0
+	_det_frame_counter += n
+	# Re-save in case caller temporarily changed time_scale.
+	_det_time_scale_saved = saved if saved != 0.0 else _det_time_scale_saved
+	return {"ok": true, "stepped": n, "type": kind, "frame_counter": _det_frame_counter}
+
+
+func _set_test_seed(args: Dictionary) -> Dictionary:
+	var s: int = int(args.get("seed", 0))
+	_det_seed = s
+	seed(s)
+	return {"ok": true, "seed": s, "tier": _det_tier}
+
+
+func _wait_until(args: Dictionary) -> Dictionary:
+	var node_path: String = str(args.get("node_path", ""))
+	var prop: String = str(args.get("property", ""))
+	var expected = args.get("expected")
+	var op: String = str(args.get("op", "eq"))
+	var timeout_frames: int = clampi(int(args.get("timeout_frames", 300)), 1, 100000)
+	var poll_kind: String = str(args.get("poll", "process"))
+	if node_path.is_empty() or prop.is_empty():
+		return {"ok": false, "error": "Missing 'node_path' or 'property'"}
+
+	for i in timeout_frames:
+		var node := _resolve_node(node_path)
+		if node != null:
+			var v = node.get(prop)
+			if _compare(_serialize(v), expected, op):
+				return {
+					"ok": true, "satisfied": true,
+					"after_frames": i, "node_path": node_path,
+					"property": prop, "final_value": _serialize(v),
+				}
+		# Under tier 2, time_scale is 0 so we have to use step_frames to make
+		# progress; under tier <2 we just await the frame and accept whatever
+		# real-time delta occurs.
+		if _det_tier >= 2:
+			Engine.time_scale = 1.0
+			match poll_kind:
+				"physics":  await get_tree().physics_frame
+				"both":
+					await get_tree().process_frame
+					await get_tree().physics_frame
+				_:          await get_tree().process_frame
+			Engine.time_scale = 0.0
+			_det_frame_counter += 1
+		else:
+			await get_tree().process_frame
+	return {
+		"ok": false, "code": "TIMEOUT", "satisfied": false,
+		"after_frames": timeout_frames,
+		"error": "wait_until: %s.%s never satisfied %s %s within %d frames"
+				 % [node_path, prop, op, str(expected), timeout_frames],
+	}
+
+
+func _det_side_effects(tier: int) -> Array:
+	var out: Array = []
+	if tier >= 1:
+		out.append("Engine.max_fps and physics_ticks_per_second pinned — game-specific frame-rate adaptation may misbehave.")
+		out.append("Real OS mouse/keyboard events are swallowed in _unhandled_input; only Input.parse_input_event (from press_*/click_*) reaches the game.")
+		out.append("seed() is reset to the provided value; subsequent seed() calls by user code override it.")
+	if tier >= 2:
+		out.append("Engine.time_scale = 0 freezes physics + process. AnimationPlayer / Tween / Timer(process_callback) stop until step_frames advances.")
+		out.append("Audio engine runs on a separate thread and is NOT affected.")
+		out.append("Time.get_ticks_msec() stays real-time; gameplay code reading it directly will drift.")
+	return out
+
+
+# OS-input gate. Runs in _unhandled_input (autoload is at /root which is the
+# topmost parent of the live scene), so the agent's Input.parse_input_event
+# calls (which bypass the input chain via the engine queue) still go through.
+func _unhandled_input(event: InputEvent) -> void:
+	if not _det_capture_input:
+		return
+	# Synthetic events from Input.parse_input_event get accumulated and arrive
+	# through the engine queue rather than _unhandled_input; this branch only
+	# fires for genuine OS-originated events. Swallow them.
+	if event is InputEventKey or event is InputEventMouseButton or event is InputEventMouseMotion:
+		get_viewport().set_input_as_handled()
+
+
+# =============================================================================
+# Phase 2.5 — PackedScene full snapshot
+# =============================================================================
+func _snapshot_scene_full(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	if not _is_safe_filename(name):
+		return {"ok": false, "error": "name must match [A-Za-z0-9_.-]+ (got %s)" % name}
+	var tree := get_tree()
+	if tree == null or tree.current_scene == null:
+		return {"ok": false, "code": "GAME_NOT_RUNNING", "error": "No current_scene to snapshot"}
+	# Reparent any orphan children to current_scene's owner chain — PackedScene
+	# only saves nodes whose owner is the root. Don't mutate the live tree
+	# permanently; build a duplicate first.
+	var scene_root: Node = tree.current_scene.duplicate(Node.DUPLICATE_USE_INSTANTIATION)
+	_reparent_owners(scene_root, scene_root)
+	var ps := PackedScene.new()
+	var pack_err := ps.pack(scene_root)
+	scene_root.queue_free()
+	if pack_err != OK:
+		return {"ok": false, "error": "PackedScene.pack failed: %s" % error_string(pack_err)}
+	_ensure_dir(CACHE_SCENE_DIR)
+	var rel := "%s%s.tscn" % [CACHE_SCENE_DIR, name]
+	var abs := ProjectSettings.globalize_path(rel)
+	var save_err := ResourceSaver.save(ps, abs)
+	if save_err != OK:
+		return {"ok": false, "error": "ResourceSaver.save failed: %s" % error_string(save_err)}
+	return {
+		"ok": true, "name": name, "scene_path": rel,
+		"node_count": _count_descendants(tree.current_scene),
+		"sha256": _file_sha256(abs),
+	}
+
+
+func _snapshot_scene_load(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	var rel := "%s%s.tscn" % [CACHE_SCENE_DIR, name]
+	var abs := ProjectSettings.globalize_path(rel)
+	if not FileAccess.file_exists(abs):
+		return {"ok": false, "code": "SCENE_SNAPSHOT_NOT_FOUND",
+				"error": "No scene snapshot named '%s'" % name,
+				"suggestions": _list_scene_snapshot_names()}
+	var tree := get_tree()
+	if tree == null:
+		return {"ok": false, "code": "GAME_NOT_RUNNING", "error": "No SceneTree"}
+	# change_scene_to_file is async — kick it and report. The caller can poll
+	# get_runtime_scene_tree to know when the new scene root appears.
+	var err := tree.change_scene_to_file(rel)
+	if err != OK:
+		return {"ok": false, "error": "change_scene_to_file failed: %s" % error_string(err)}
+	return {
+		"ok": true, "name": name, "scene_path": rel,
+		"hint": "Scene swap is deferred to the next idle frame. Poll get_runtime_scene_tree if you need to wait.",
+	}
+
+
+func _snapshot_scene_list(_args: Dictionary) -> Dictionary:
+	var names := _list_scene_snapshot_names()
+	return {"ok": true, "scenes": names, "count": names.size()}
+
+
+func _snapshot_scene_delete(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	var rel := "%s%s.tscn" % [CACHE_SCENE_DIR, name]
+	var abs := ProjectSettings.globalize_path(rel)
+	if not FileAccess.file_exists(abs):
+		return {"ok": false, "code": "SCENE_SNAPSHOT_NOT_FOUND", "error": "No snapshot '%s'" % name}
+	DirAccess.remove_absolute(abs)
+	return {"ok": true, "name": name, "deleted": rel}
+
+
+func _list_scene_snapshot_names() -> Array:
+	var out: Array = []
+	var abs := ProjectSettings.globalize_path(CACHE_SCENE_DIR)
+	if not DirAccess.dir_exists_absolute(abs): return out
+	var dir := DirAccess.open(abs)
+	if dir == null: return out
+	dir.list_dir_begin()
+	var f := dir.get_next()
+	while f != "":
+		if not dir.current_is_dir() and f.ends_with(".tscn"):
+			out.append(f.get_basename())
+		f = dir.get_next()
+	dir.list_dir_end()
+	return out
+
+
+func _reparent_owners(node: Node, root: Node) -> void:
+	# Walk the tree and set owner = root so PackedScene picks every node up.
+	# duplicate(DUPLICATE_USE_INSTANTIATION) already inherits owner correctly
+	# in most cases; this is a defensive pass for nodes added at runtime.
+	for c in node.get_children():
+		if c.owner == null or not c.owner == root:
+			c.owner = root
+		_reparent_owners(c, root)
+
+
+func _count_descendants(node: Node) -> int:
+	var n := 1
+	for c in node.get_children():
+		n += _count_descendants(c)
+	return n
+
+
+# =============================================================================
+# Phase 2.5 — AI vision diff (compare_with_ai)
+# =============================================================================
+# Calls Anthropic Claude with two base64 PNGs + a natural-language instruction
+# and asks for a verdict. Requires ANTHROPIC_API_KEY in the game process env
+# (the MCP server cannot relay env vars to Godot — set it before launching
+# the editor / game). Returns the raw model verdict plus a parsed pass/fail
+# extracted from a [[VERDICT: pass|fail]] tag the prompt asks for.
+
+const _AI_API_URL := "https://api.anthropic.com/v1/messages"
+const _AI_MODEL_DEFAULT := "claude-sonnet-4-6"
+
+
+func _compare_with_ai(args: Dictionary) -> Dictionary:
+	var a_b64: String = str(args.get("a_b64", ""))
+	var b_b64: String = str(args.get("b_b64", ""))
+	var instruction: String = str(args.get("instruction", "")).strip_edges()
+	var model: String = str(args.get("model", _AI_MODEL_DEFAULT))
+	var max_tokens: int = int(args.get("max_tokens", 1024))
+	if a_b64.is_empty() or b_b64.is_empty():
+		return {"ok": false, "error": "Missing 'a_b64' or 'b_b64' (base64-encoded PNG)"}
+	if instruction.is_empty():
+		return {"ok": false, "error": "Missing 'instruction' — what should the model check?"}
+
+	var api_key := OS.get_environment("ANTHROPIC_API_KEY")
+	if api_key.is_empty():
+		return {"ok": false, "code": "MISSING_API_KEY",
+				"error": "ANTHROPIC_API_KEY not set in the game process env. Export it before launching the editor."}
+
+	var body := {
+		"model": model,
+		"max_tokens": max_tokens,
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type": "text", "text":
+					"Image A and Image B follow. Compare them per the instruction below. " +
+					"End your response with exactly one line in this format:\n" +
+					"[[VERDICT: pass]]   or   [[VERDICT: fail]]\n\n" +
+					"INSTRUCTION:\n" + instruction},
+				{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": a_b64}},
+				{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b_b64}},
+			],
+		}],
+	}
+	var headers := PackedStringArray([
+		"x-api-key: " + api_key,
+		"anthropic-version: 2023-06-01",
+		"content-type: application/json",
+	])
+
+	var req := HTTPRequest.new()
+	req.timeout = 60.0
+	add_child(req)
+	var err := req.request(_AI_API_URL, headers, HTTPClient.METHOD_POST, JSON.stringify(body))
+	if err != OK:
+		req.queue_free()
+		return {"ok": false, "error": "HTTPRequest.request failed: %s" % error_string(err)}
+	var response = await req.request_completed
+	req.queue_free()
+	# response is [result, response_code, headers, body_bytes]
+	var result_code: int = response[0]
+	var http_code: int = response[1]
+	var body_bytes: PackedByteArray = response[3]
+	if result_code != HTTPRequest.RESULT_SUCCESS:
+		return {"ok": false, "error": "HTTPRequest result=%d (network/timeout)" % result_code}
+	if http_code < 200 or http_code >= 300:
+		return {"ok": false, "error": "Anthropic API %d: %s" % [http_code, body_bytes.get_string_from_utf8()]}
+
+	var parsed = JSON.parse_string(body_bytes.get_string_from_utf8())
+	if not parsed is Dictionary:
+		return {"ok": false, "error": "Could not parse Anthropic response JSON"}
+	var content: Array = parsed.get("content", [])
+	if content.is_empty():
+		return {"ok": false, "error": "Empty content in Anthropic response"}
+	var text: String = ""
+	for part in content:
+		if part is Dictionary and str(part.get("type", "")) == "text":
+			text += str(part.get("text", ""))
+	var verdict := _parse_verdict_tag(text)
+	return {
+		"ok": verdict == "pass",
+		"verdict": verdict,
+		"model": str(parsed.get("model", model)),
+		"usage": parsed.get("usage", {}),
+		"text": text,
+		"error": "" if verdict == "pass" else "AI vision diff returned verdict=%s" % verdict,
+	}
+
+
+func _parse_verdict_tag(text: String) -> String:
+	# Loose match: case-insensitive, tolerate whitespace inside the brackets.
+	var lower := text.to_lower()
+	if lower.find("[[verdict: pass]]") >= 0 or lower.find("[[verdict:pass]]") >= 0:
+		return "pass"
+	if lower.find("[[verdict: fail]]") >= 0 or lower.find("[[verdict:fail]]") >= 0:
+		return "fail"
+	# Fallback heuristic — model may have ignored the tag instruction.
+	if lower.find("\nfail") >= 0 or lower.find(" fail.") >= 0 or lower.find(" fails") >= 0:
+		return "fail"
+	if lower.find("pass") >= 0:
+		return "pass"
+	return "unknown"
 
 
 # =============================================================================

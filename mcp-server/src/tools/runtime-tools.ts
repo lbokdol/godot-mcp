@@ -719,6 +719,188 @@ export const runtimeTools: ToolDefinition[] = [
       required: ['a_b64', 'b_b64'],
     },
   },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 1.5 — Deterministic mode (godot_ai_test_planning.md §9)
+  //
+  // Tier 0 (Off):     default — no engine state changes.
+  // Tier 1 (Soft):    seed lock + Engine.max_fps & physics_ticks pinned to
+  //                   `fps` + real OS mouse/keyboard ignored. ~60% repeat.
+  // Tier 2 (Stepped): Tier 1 + Engine.time_scale=0; advance only via
+  //                   step_frames. ~95% repeat — the sweet spot for visual
+  //                   regression and SSIM-stable baselines.
+  // Tier 3 (Hooked):  Plan §9.4 future work — out of scope here.
+  //
+  // Known side effects under Tier 2 (recipe authors MUST account for):
+  //   * AnimationPlayer / Tween / Timer(process_callback) all freeze.
+  //   * Audio engine has its own thread → unaffected.
+  //   * Time.get_ticks_msec() stays real-time.
+  //   * physics_ticks_per_second ≠ max_fps → use step_frames(type="both").
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    name: 'enable_deterministic_mode',
+    description:
+      "Lock the engine into a repeatable state for stable visual regression and snapshot diffs.\n\n" +
+      "USE WHEN: About to run capture_baseline or a multi-step input scenario that you want to replay bit-identically.\n" +
+      "DO NOT USE WHEN: Running gameplay-feel tests — Tier 2 freezes Animation/Tween/Timer; behavior drifts from real-time play.\n" +
+      "COMMON FAILURE: A scene that polls Time.get_ticks_msec() for gameplay logic will misbehave at Tier 2 (the clock stays real-time, time_scale doesn't).\n" +
+      "EXAMPLE: enable_deterministic_mode(tier=2, seed=1234, fps=60) → step_frames(n=2) → capture_screenshot",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tier: { type: 'number', default: 2, description: '0=Off, 1=Soft (seed+fps+ignore real input), 2=Stepped (time_scale=0). Clamped to [0..2] server-side.' },
+        seed: { type: 'number', default: 1234, description: 'Global RNG seed.' },
+        fps:  { type: 'number', default: 60, description: 'Pin Engine.max_fps and physics_ticks_per_second to this value.' },
+      },
+    },
+  },
+  {
+    name: 'disable_deterministic_mode',
+    description:
+      "Restore the engine to free-running mode (time_scale, max_fps, physics_ticks). Real OS input flows again.\n\n" +
+      "USE WHEN: Done with regression checks; want the game to behave like normal play.\n" +
+      "DO NOT USE WHEN: You only want to lower the tier — call enable_deterministic_mode again with the lower tier instead (it tears down cleanly).\n" +
+      "COMMON FAILURE: None — idempotent.\n" +
+      "EXAMPLE: disable_deterministic_mode()",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_deterministic_state',
+    description:
+      "Read the current tier / seed / frame counter / fps / time_scale.\n\n" +
+      "USE WHEN: Debugging why step_frames returns MODE_CONFLICT (you forgot to enable Tier 2).\n" +
+      "DO NOT USE WHEN: You just called enable_deterministic_mode — the return value of that call has the same info.\n" +
+      "COMMON FAILURE: None.\n" +
+      "EXAMPLE: get_deterministic_state() → { tier: 2, seed: 1234, frame_counter: 12, ... }",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'step_frames',
+    description:
+      "Advance N frames manually. Requires Tier 2 (Engine.time_scale=0). Lifts time_scale to 1 for exactly N frames, then re-zeroes it.\n\n" +
+      "USE WHEN: Between an input and an assertion under Tier 2 — without this, the input never gets a chance to apply.\n" +
+      "DO NOT USE WHEN: Not in Tier 2 — returns MODE_CONFLICT. Use wait_after_ms in input tools instead under Tier 0/1.\n" +
+      "COMMON FAILURE: type='process' alone skips physics updates (collision / RigidBody). For most games use 'both'.\n" +
+      "EXAMPLE: enable_deterministic_mode(tier=2); press_action(name='jump'); step_frames(n=4, type='both'); capture_screenshot()",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        n:    { type: 'number', default: 1, description: 'Number of frames to advance.' },
+        type: { type: 'string', enum: ['process', 'physics', 'both'], default: 'both' },
+      },
+    },
+  },
+  {
+    name: 'set_test_seed',
+    description:
+      "Re-seed the global RNG without changing tier or other state.\n\n" +
+      "USE WHEN: Between scenarios that should both be repeatable but with different random outcomes.\n" +
+      "DO NOT USE WHEN: Initial seed is fine — enable_deterministic_mode already seeds.\n" +
+      "COMMON FAILURE: User code calls seed() too, overriding this.\n" +
+      "EXAMPLE: set_test_seed(seed=42)",
+    inputSchema: {
+      type: 'object',
+      properties: { seed: { type: 'number', default: 0 } },
+      required: ['seed'],
+    },
+  },
+  {
+    name: 'wait_until',
+    description:
+      "Block until a node property satisfies a comparison, or up to timeout_frames.\n\n" +
+      "USE WHEN: Async game logic — fade-in finishes, dialog opens, async load completes.\n" +
+      "DO NOT USE WHEN: You can predict the exact frame count — step_frames is cheaper and deterministic.\n" +
+      "COMMON FAILURE: TIMEOUT after timeout_frames. Either the predicate is wrong or timeout is too short. Under Tier 2 each frame is one step_frame; under Tier 0/1 each frame is real-time so timeout is approximate.\n" +
+      "EXAMPLE: wait_until(node_path='/root/Main/UI/Dialog', property='visible', expected=true, timeout_frames=120)",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        node_path:      NODE_PATH_PROP,
+        property:       { type: 'string' },
+        expected:       { description: 'Any JSON-serializable value.' },
+        op:             { type: 'string', enum: ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'not_in'], default: 'eq' },
+        timeout_frames: { type: 'number', default: 300 },
+        poll:           { type: 'string', enum: ['process', 'physics', 'both'], default: 'process', description: 'Which frame to await per poll iteration (Tier 2 only).' },
+      },
+      required: ['node_path', 'property', 'expected'],
+    },
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2.5 — PackedScene full snapshot + AI vision diff (§10.5)
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    name: 'snapshot_scene_full',
+    description:
+      "Pack the entire current_scene into a .tscn under the cache dir. Reusable as a save-state.\n\n" +
+      "USE WHEN: Capturing a complex state that property-bag snapshots can't reproduce (newly-instantiated nodes, dynamic children).\n" +
+      "DO NOT USE WHEN: A property-bag snapshot is enough — full scene packs are large and slower to restore.\n" +
+      "COMMON FAILURE: PackedScene.pack rejects nodes whose owner is null. The autoload reparents on a duplicate before packing, but custom resources without ResourceFormat support may still fail.\n" +
+      "EXAMPLE: snapshot_scene_full(name='before_combat')",
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Identifier. [A-Za-z0-9_.-]+.' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'snapshot_scene_load',
+    description:
+      "Swap the current scene to a previously-packed .tscn via change_scene_to_file.\n\n" +
+      "USE WHEN: Returning to a known full state at the start of a new test scenario.\n" +
+      "DO NOT USE WHEN: You only need to reset a few properties — snapshot_restore is faster and doesn't tear down the scene.\n" +
+      "COMMON FAILURE: SCENE_SNAPSHOT_NOT_FOUND. Scene swap is deferred to the next idle frame — poll get_runtime_scene_tree to wait.\n" +
+      "EXAMPLE: snapshot_scene_load(name='before_combat')",
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'snapshot_scene_list',
+    description:
+      "List all packed scene snapshot names.\n\n" +
+      "USE WHEN: Surveying available save-states.\n" +
+      "DO NOT USE WHEN: You only just packed one — its name is what you passed.\n" +
+      "COMMON FAILURE: None.\n" +
+      "EXAMPLE: snapshot_scene_list() → { scenes: ['before_combat', 'main_menu_loaded'], count: 2 }",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'snapshot_scene_delete',
+    description:
+      "Delete a packed scene snapshot.\n\n" +
+      "USE WHEN: Cleaning up stale snapshots after a scene rewrite.\n" +
+      "DO NOT USE WHEN: You want to REPLACE — just call snapshot_scene_full with the same name (overwrites).\n" +
+      "COMMON FAILURE: SCENE_SNAPSHOT_NOT_FOUND if already removed.\n" +
+      "EXAMPLE: snapshot_scene_delete(name='old_scene')",
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'compare_with_ai',
+    description:
+      "Compare two base64 PNGs with Claude (or a configured Anthropic-API-compatible model) using a natural-language instruction. Returns the model's verdict plus a pass/fail extracted from a [[VERDICT: pass|fail]] tag the prompt asks for.\n\n" +
+      "USE WHEN: SSIM is too brittle (you want \"player visible? yes/no\" not pixel-identical) or you want a human-readable explanation of a difference.\n" +
+      "DO NOT USE WHEN: SSIM / MAE / pixel_diff_pct would do — those are free, fast, deterministic. AI calls cost tokens and have latency.\n" +
+      "COMMON FAILURE: MISSING_API_KEY when ANTHROPIC_API_KEY isn't in the game process env — set it before launching the editor. Network/timeout returns error string from HTTPRequest.\n" +
+      "EXAMPLE: compare_with_ai(a_b64=…, b_b64=…, instruction='Image A should show a victory banner. Image B should show the same banner with the same text. Position differences are OK.')",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        a_b64:       { type: 'string', description: 'Base64-encoded PNG.' },
+        b_b64:       { type: 'string', description: 'Base64-encoded PNG.' },
+        instruction: { type: 'string', description: 'What the model should verify. Be explicit about what counts as a regression.' },
+        model:       { type: 'string', description: "Anthropic model id. Default 'claude-sonnet-4-6'." },
+        max_tokens:  { type: 'number', default: 1024 },
+      },
+      required: ['a_b64', 'b_b64', 'instruction'],
+    },
+  },
 ];
 
 /**

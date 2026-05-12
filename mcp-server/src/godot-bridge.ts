@@ -66,6 +66,12 @@ export const RUNTIME_ONLY_TOOLS = new Set<string>([
   // Phase 2 §10.2 — Visual regression baselines
   'capture_baseline', 'compare_with_baseline', 'update_baseline', 'update_mask',
   'list_baselines', 'delete_baseline', 'compare_screenshots_adhoc',
+  // Phase 1.5 §9 — Deterministic mode
+  'enable_deterministic_mode', 'disable_deterministic_mode',
+  'get_deterministic_state', 'step_frames', 'set_test_seed', 'wait_until',
+  // Phase 2.5 §10.5 — PackedScene snapshots + AI vision diff
+  'snapshot_scene_full', 'snapshot_scene_load', 'snapshot_scene_list',
+  'snapshot_scene_delete', 'compare_with_ai',
 ]);
 
 interface PendingRequest {
