@@ -27,10 +27,18 @@ extends Node
 
 const SERVER_URL := "ws://127.0.0.1:6505"
 const CACHE_SCREENSHOT_DIR := "res://addons/godot_mcp/cache/screenshots/"
+const CACHE_SNAPSHOT_DIR := "res://addons/godot_mcp/cache/snapshots/"
+const CACHE_BASELINE_DIR := "res://addons/godot_mcp/cache/baseline/"
 const LOG_RING_CAPACITY := 500
 const PRINT_RING_CAPACITY := 500
 const ERROR_RING_CAPACITY := 500
 const DEFAULT_WAIT_AFTER_MS := 33
+# SSIM constants — c1 = (0.01*L)², c2 = (0.03*L)² with L=255 dynamic range.
+const SSIM_C1 := 6.5025      # (0.01 * 255)^2
+const SSIM_C2 := 58.5225     # (0.03 * 255)^2
+const SSIM_BLOCK := 8        # 8×8 windowed comparison (smaller than the 11×11
+                              # MATLAB default but ~2× faster — sufficient for
+                              # pixel-art regression where 1-px shifts matter).
 
 var _socket: WebSocketPeer = WebSocketPeer.new()
 var _connected := false
@@ -178,6 +186,19 @@ func _dispatch(tool_name: String, args: Dictionary) -> Dictionary:
 		"set_node_property":        return _set_node_property(args)
 		"call_node_method":         return _call_node_method(args)
 		"add_node_runtime":         return _add_node_runtime(args)
+		# Phase 2 — Property bag snapshots
+		"snapshot_capture":         return _snapshot_capture(args)
+		"snapshot_restore":         return _snapshot_restore(args)
+		"snapshot_diff":            return _snapshot_diff(args)
+		"snapshot_list":            return _snapshot_list(args)
+		# Phase 2 — Visual regression baselines
+		"capture_baseline":         return _capture_baseline(args)
+		"compare_with_baseline":    return _compare_with_baseline(args)
+		"update_baseline":          return _update_baseline(args)
+		"update_mask":              return _update_mask(args)
+		"list_baselines":           return _list_baselines(args)
+		"delete_baseline":          return _delete_baseline(args)
+		"compare_screenshots_adhoc": return _compare_screenshots_adhoc(args)
 		_:
 			return {"ok": false, "error": "Unknown runtime tool: %s" % tool_name}
 
@@ -1158,10 +1179,703 @@ func push_engine_log(level: String, text: String) -> void:
 
 
 # =============================================================================
-func _ensure_cache_dir() -> void:
-	var abs := ProjectSettings.globalize_path(CACHE_SCREENSHOT_DIR)
+# Phase 2 — Property bag snapshots
+# =============================================================================
+# A snapshot is a JSON file recording (node_path → {property → serialized_value})
+# for a caller-supplied set of nodes and properties. Stored under
+# CACHE_SNAPSHOT_DIR/<name>.json. Two pieces of state:
+#   1. on-disk file (durable across sessions)
+#   2. in-memory mirror (faster diff/restore — repopulated on first touch)
+var _snapshots: Dictionary = {}
+
+
+func _snapshot_capture(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	if not _is_safe_filename(name):
+		return {"ok": false, "error": "name must match [A-Za-z0-9_.-]+ (got %s)" % name}
+	var node_paths: Array = args.get("node_paths", [])
+	var properties: Array = args.get("properties", [])
+	var include_children: bool = bool(args.get("include_children", false))
+	if node_paths.is_empty():
+		return {"ok": false, "error": "Missing 'node_paths' (at least one required)"}
+	if properties.is_empty():
+		# Sensible default subset that covers most regression checks.
+		properties = ["position", "global_position", "rotation", "scale", "visible", "modulate"]
+
+	var entries := {}
+	for raw_path_v in node_paths:
+		var raw_path := str(raw_path_v)
+		var targets: Array = []
+		var node := _resolve_node(raw_path)
+		if node == null:
+			continue
+		targets.append(node)
+		if include_children:
+			_collect_descendants(node, targets)
+		for t in targets:
+			var node_data := {}
+			for pname_v in properties:
+				var pname := str(pname_v)
+				var v = t.get(pname)
+				if v != null:
+					node_data[pname] = _serialize(v)
+			if not node_data.is_empty():
+				entries[str(t.get_path())] = node_data
+
+	var snapshot := {
+		"name": name,
+		"captured_at_ms": Time.get_ticks_msec(),
+		"properties": properties,
+		"entries": entries,
+	}
+	_snapshots[name] = snapshot
+	var path := _persist_snapshot(name, snapshot)
+	return {
+		"ok": true,
+		"name": name,
+		"node_count": entries.size(),
+		"property_count": properties.size(),
+		"path": path,
+	}
+
+
+func _snapshot_restore(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	var snapshot := _load_snapshot(name)
+	if snapshot.is_empty():
+		return {"ok": false, "code": "SNAPSHOT_NOT_FOUND",
+				"error": "No snapshot named '%s'" % name,
+				"suggestions": _list_snapshot_names()}
+	var entries: Dictionary = snapshot.get("entries", {})
+	var restored := 0
+	var missing: Array = []
+	for node_path_v in entries.keys():
+		var node_path := str(node_path_v)
+		var node := _resolve_node(node_path)
+		if node == null:
+			missing.append(node_path)
+			continue
+		var props: Dictionary = entries[node_path]
+		for pname_v in props.keys():
+			var pname := str(pname_v)
+			node.set(pname, _deserialize(props[pname]))
+			restored += 1
+	return {
+		"ok": true,
+		"name": name,
+		"restored_assignments": restored,
+		"missing_nodes": missing,
+	}
+
+
+func _snapshot_diff(args: Dictionary) -> Dictionary:
+	var name_a: String = str(args.get("name_a", ""))
+	var name_b: String = str(args.get("name_b", ""))
+	if name_a.is_empty() or name_b.is_empty():
+		return {"ok": false, "error": "Missing 'name_a' or 'name_b'"}
+	var a := _load_snapshot(name_a)
+	var b := _load_snapshot(name_b)
+	if a.is_empty():
+		return {"ok": false, "code": "SNAPSHOT_NOT_FOUND", "error": "Missing snapshot: %s" % name_a}
+	if b.is_empty():
+		return {"ok": false, "code": "SNAPSHOT_NOT_FOUND", "error": "Missing snapshot: %s" % name_b}
+
+	var entries_a: Dictionary = a.get("entries", {})
+	var entries_b: Dictionary = b.get("entries", {})
+	var changes: Array = []
+	var only_in_a: Array = []
+	var only_in_b: Array = []
+	for k in entries_a.keys():
+		if not entries_b.has(k):
+			only_in_a.append(str(k)); continue
+		var pa: Dictionary = entries_a[k]
+		var pb: Dictionary = entries_b[k]
+		for pname in pa.keys():
+			if not pb.has(pname):
+				changes.append({"node_path": str(k), "property": str(pname), "a": pa[pname], "b": null, "kind": "removed"})
+				continue
+			if not _deep_equal(pa[pname], pb[pname]):
+				changes.append({"node_path": str(k), "property": str(pname), "a": pa[pname], "b": pb[pname], "kind": "changed"})
+		for pname in pb.keys():
+			if not pa.has(pname):
+				changes.append({"node_path": str(k), "property": str(pname), "a": null, "b": pb[pname], "kind": "added"})
+	for k in entries_b.keys():
+		if not entries_a.has(k):
+			only_in_b.append(str(k))
+	return {
+		"ok": true,
+		"name_a": name_a,
+		"name_b": name_b,
+		"changes": changes,
+		"only_in_a": only_in_a,
+		"only_in_b": only_in_b,
+		"change_count": changes.size(),
+		"identical": changes.is_empty() and only_in_a.is_empty() and only_in_b.is_empty(),
+	}
+
+
+func _snapshot_list(_args: Dictionary) -> Dictionary:
+	var names := _list_snapshot_names()
+	return {"ok": true, "snapshots": names, "count": names.size()}
+
+
+# =============================================================================
+# Snapshot helpers
+# =============================================================================
+func _persist_snapshot(name: String, snapshot: Dictionary) -> String:
+	_ensure_dir(CACHE_SNAPSHOT_DIR)
+	var path := "%s%s.json" % [CACHE_SNAPSHOT_DIR, name]
+	var abs := ProjectSettings.globalize_path(path)
+	var f := FileAccess.open(abs, FileAccess.WRITE)
+	if f == null:
+		return ""
+	f.store_string(JSON.stringify(snapshot, "  "))
+	f.close()
+	return path
+
+
+func _load_snapshot(name: String) -> Dictionary:
+	if _snapshots.has(name):
+		return _snapshots[name]
+	var path := "%s%s.json" % [CACHE_SNAPSHOT_DIR, name]
+	var abs := ProjectSettings.globalize_path(path)
+	if not FileAccess.file_exists(abs):
+		return {}
+	var f := FileAccess.open(abs, FileAccess.READ)
+	if f == null: return {}
+	var txt := f.get_as_text()
+	f.close()
+	var parsed = JSON.parse_string(txt)
+	if parsed is Dictionary:
+		_snapshots[name] = parsed
+		return parsed
+	return {}
+
+
+func _list_snapshot_names() -> Array:
+	var out: Array = []
+	var abs := ProjectSettings.globalize_path(CACHE_SNAPSHOT_DIR)
+	if not DirAccess.dir_exists_absolute(abs):
+		return out
+	var dir := DirAccess.open(abs)
+	if dir == null: return out
+	dir.list_dir_begin()
+	var f := dir.get_next()
+	while f != "":
+		if not dir.current_is_dir() and f.ends_with(".json"):
+			out.append(f.get_basename())
+		f = dir.get_next()
+	dir.list_dir_end()
+	return out
+
+
+func _collect_descendants(node: Node, out: Array) -> void:
+	for c in node.get_children():
+		out.append(c)
+		_collect_descendants(c, out)
+
+
+func _deep_equal(a: Variant, b: Variant) -> bool:
+	if typeof(a) != typeof(b): return false
+	if a is Dictionary:
+		var ad: Dictionary = a; var bd: Dictionary = b
+		if ad.size() != bd.size(): return false
+		for k in ad.keys():
+			if not bd.has(k): return false
+			if not _deep_equal(ad[k], bd[k]): return false
+		return true
+	if a is Array:
+		var aa: Array = a; var ba: Array = b
+		if aa.size() != ba.size(): return false
+		for i in aa.size():
+			if not _deep_equal(aa[i], ba[i]): return false
+		return true
+	if a is float and b is float:
+		return absf(float(a) - float(b)) < 0.0001
+	return a == b
+
+
+# =============================================================================
+# Phase 2 — Visual regression
+# =============================================================================
+# Baselines live under CACHE_BASELINE_DIR/<name>.{png,mask.png,meta.json}.
+# meta.json records {algorithm, threshold, created_at_ms, width, height,
+# sha256, last_compared}. mask.png is optional; black/transparent pixels there
+# are excluded from comparison so animated regions (clocks, particle FX) can
+# be ignored.
+
+func _capture_baseline(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	if not _is_safe_filename(name):
+		return {"ok": false, "error": "name must match [A-Za-z0-9_.-]+ (got %s)" % name}
+	var algorithm: String = str(args.get("algorithm", "ssim"))
+	var threshold: float = float(args.get("threshold", _default_threshold(algorithm)))
+	var img := _grab_viewport_image()
+	if img == null:
+		return {"ok": false, "code": "RENDERING_REQUIRED", "error": "No viewport image (game not running?)"}
+	_ensure_dir(CACHE_BASELINE_DIR)
+	var png_path := "%s%s.png" % [CACHE_BASELINE_DIR, name]
+	var meta_path := "%s%s.meta.json" % [CACHE_BASELINE_DIR, name]
+	var abs_png := ProjectSettings.globalize_path(png_path)
+	var save_err := img.save_png(abs_png)
+	if save_err != OK:
+		return {"ok": false, "error": "save_png failed: %s" % error_string(save_err)}
+	var meta := {
+		"name": name,
+		"algorithm": algorithm,
+		"threshold": threshold,
+		"created_at_ms": Time.get_ticks_msec(),
+		"width": img.get_width(),
+		"height": img.get_height(),
+		"sha256": _file_sha256(abs_png),
+	}
+	_write_json(meta_path, meta)
+	return {
+		"ok": true, "name": name, "png_path": png_path, "meta_path": meta_path,
+		"width": img.get_width(), "height": img.get_height(),
+		"algorithm": algorithm, "threshold": threshold,
+	}
+
+
+func _compare_with_baseline(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	var meta := _read_baseline_meta(name)
+	if meta.is_empty():
+		return {"ok": false, "code": "BASELINE_NOT_FOUND",
+				"error": "No baseline named '%s'" % name,
+				"suggestions": _list_baseline_names()}
+	var algorithm: String = str(args.get("algorithm", meta.get("algorithm", "ssim")))
+	var threshold: float = float(args.get("threshold", meta.get("threshold", _default_threshold(algorithm))))
+	var baseline_path := "%s%s.png" % [CACHE_BASELINE_DIR, name]
+	var baseline_img := _load_image(baseline_path)
+	if baseline_img == null:
+		return {"ok": false, "error": "Could not read baseline PNG: %s" % baseline_path}
+	var current_img := _grab_viewport_image()
+	if current_img == null:
+		return {"ok": false, "code": "RENDERING_REQUIRED", "error": "No viewport image"}
+
+	if current_img.get_size() != baseline_img.get_size():
+		return {"ok": false, "code": "SIZE_MISMATCH",
+				"error": "Current %s vs baseline %s — update_baseline or resize the viewport"
+				 % [str(current_img.get_size()), str(baseline_img.get_size())]}
+
+	var mask_img: Image = null
+	var mask_path := "%s%s.mask.png" % [CACHE_BASELINE_DIR, name]
+	var abs_mask := ProjectSettings.globalize_path(mask_path)
+	if FileAccess.file_exists(abs_mask):
+		mask_img = _load_image(mask_path)
+
+	var score := _compare_images(baseline_img, current_img, mask_img, algorithm)
+	var pass_check := _passes_threshold(algorithm, score, threshold)
+	# Save diff visualization for fail cases — helpful for the agent.
+	var diff_png_path := ""
+	if not pass_check:
+		diff_png_path = _save_diff_viz(name, baseline_img, current_img, mask_img)
+
+	# Touch meta with last comparison stats.
+	meta["last_compared_at_ms"] = Time.get_ticks_msec()
+	meta["last_score"] = score
+	meta["last_pass"] = pass_check
+	_write_json("%s%s.meta.json" % [CACHE_BASELINE_DIR, name], meta)
+
+	return {
+		"ok": pass_check,
+		"name": name, "algorithm": algorithm,
+		"score": score, "threshold": threshold,
+		"size": [current_img.get_width(), current_img.get_height()],
+		"mask_used": mask_img != null,
+		"diff_png_path": diff_png_path,
+		"error": "" if pass_check else "Visual regression: %s score=%.4f vs threshold=%.4f" % [algorithm, score, threshold],
+	}
+
+
+func _update_baseline(args: Dictionary) -> Dictionary:
+	# Same flow as capture_baseline; semantically distinct so the agent can
+	# audit which scenes it "agreed to drift on".
+	return _capture_baseline(args)
+
+
+func _update_mask(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	var region = args.get("region", null)
+	var clear: bool = bool(args.get("clear", false))
+	var meta := _read_baseline_meta(name)
+	if meta.is_empty():
+		return {"ok": false, "code": "BASELINE_NOT_FOUND", "error": "No baseline named '%s'" % name}
+	var w: int = int(meta.get("width", 0))
+	var h: int = int(meta.get("height", 0))
+	var mask_path := "%s%s.mask.png" % [CACHE_BASELINE_DIR, name]
+	var abs_mask := ProjectSettings.globalize_path(mask_path)
+
+	var mask: Image
+	if FileAccess.file_exists(abs_mask) and not clear:
+		mask = _load_image(mask_path)
+	else:
+		# Default mask = fully WHITE (everything compared). Painting black =
+		# excluded keeps the convention from the plan §10.2.
+		mask = Image.create(w, h, false, Image.FORMAT_RGBA8)
+		mask.fill(Color(1, 1, 1, 1))
+
+	if region != null and region is Dictionary:
+		var rx: int = int(region.get("x", 0))
+		var ry: int = int(region.get("y", 0))
+		var rw: int = int(region.get("w", 0))
+		var rh: int = int(region.get("h", 0))
+		var rect := Rect2i(rx, ry, rw, rh).intersection(Rect2i(0, 0, w, h))
+		for y in range(rect.position.y, rect.position.y + rect.size.y):
+			for x in range(rect.position.x, rect.position.x + rect.size.x):
+				mask.set_pixel(x, y, Color(0, 0, 0, 1))
+
+	_ensure_dir(CACHE_BASELINE_DIR)
+	var err := mask.save_png(abs_mask)
+	if err != OK:
+		return {"ok": false, "error": "save_png failed: %s" % error_string(err)}
+	return {"ok": true, "name": name, "mask_path": mask_path, "cleared": clear}
+
+
+func _list_baselines(_args: Dictionary) -> Dictionary:
+	var names := _list_baseline_names()
+	var rows: Array = []
+	for n in names:
+		var m := _read_baseline_meta(str(n))
+		if not m.is_empty():
+			rows.append({
+				"name": str(n),
+				"algorithm": m.get("algorithm", ""),
+				"threshold": m.get("threshold", 0.0),
+				"width": m.get("width", 0),
+				"height": m.get("height", 0),
+				"created_at_ms": m.get("created_at_ms", 0),
+				"last_score": m.get("last_score"),
+				"last_pass": m.get("last_pass"),
+			})
+	return {"ok": true, "baselines": rows, "count": rows.size()}
+
+
+func _delete_baseline(args: Dictionary) -> Dictionary:
+	var name: String = str(args.get("name", "")).strip_edges()
+	if name.is_empty():
+		return {"ok": false, "error": "Missing 'name'"}
+	var deleted: Array = []
+	for suffix in [".png", ".mask.png", ".meta.json"]:
+		var rel := "%s%s%s" % [CACHE_BASELINE_DIR, name, suffix]
+		var abs := ProjectSettings.globalize_path(rel)
+		if FileAccess.file_exists(abs):
+			DirAccess.remove_absolute(abs)
+			deleted.append(rel)
+	if deleted.is_empty():
+		return {"ok": false, "code": "BASELINE_NOT_FOUND", "error": "No baseline named '%s'" % name}
+	return {"ok": true, "name": name, "deleted": deleted}
+
+
+func _compare_screenshots_adhoc(args: Dictionary) -> Dictionary:
+	var a_b64: String = str(args.get("a_b64", ""))
+	var b_b64: String = str(args.get("b_b64", ""))
+	if a_b64.is_empty() or b_b64.is_empty():
+		return {"ok": false, "error": "Missing 'a_b64' or 'b_b64' (base64-encoded PNG)"}
+	var algorithm: String = str(args.get("algorithm", "ssim"))
+	var threshold: float = float(args.get("threshold", _default_threshold(algorithm)))
+	var a_img := _image_from_b64(a_b64)
+	var b_img := _image_from_b64(b_b64)
+	if a_img == null or b_img == null:
+		return {"ok": false, "error": "Could not decode base64 PNG"}
+	if a_img.get_size() != b_img.get_size():
+		return {"ok": false, "code": "SIZE_MISMATCH",
+				"error": "Image A %s vs B %s" % [str(a_img.get_size()), str(b_img.get_size())]}
+	var score := _compare_images(a_img, b_img, null, algorithm)
+	var pass_check := _passes_threshold(algorithm, score, threshold)
+	return {
+		"ok": pass_check, "algorithm": algorithm, "score": score, "threshold": threshold,
+		"size": [a_img.get_width(), a_img.get_height()],
+		"error": "" if pass_check else "Ad-hoc compare: %s score=%.4f vs threshold=%.4f" % [algorithm, score, threshold],
+	}
+
+
+# =============================================================================
+# Image comparison algorithms
+# =============================================================================
+func _compare_images(a: Image, b: Image, mask: Image, algorithm: String) -> float:
+	# Normalize to RGB8 — alpha channel is irrelevant for visual regression.
+	var aa := a.duplicate() as Image
+	var bb := b.duplicate() as Image
+	if aa.get_format() != Image.FORMAT_RGB8: aa.convert(Image.FORMAT_RGB8)
+	if bb.get_format() != Image.FORMAT_RGB8: bb.convert(Image.FORMAT_RGB8)
+	match algorithm:
+		"mae":            return _alg_mae(aa, bb, mask)
+		"pixel_diff_pct": return _alg_pixel_diff_pct(aa, bb, mask, 8)
+		"ssim":           return _alg_ssim(aa, bb, mask)
+		_:                return _alg_ssim(aa, bb, mask)
+
+
+func _alg_mae(a: Image, b: Image, mask: Image) -> float:
+	# Mean Absolute Error per channel, normalized to [0,1]. Lower = closer.
+	var w := a.get_width(); var h := a.get_height()
+	var total := 0.0
+	var counted := 0
+	for y in h:
+		for x in w:
+			if not _pixel_unmasked(mask, x, y): continue
+			var ca := a.get_pixel(x, y)
+			var cb := b.get_pixel(x, y)
+			total += absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b)
+			counted += 1
+	if counted == 0: return 0.0
+	return total / (counted * 3.0)
+
+
+func _alg_pixel_diff_pct(a: Image, b: Image, mask: Image, channel_threshold: int) -> float:
+	# Fraction of pixels where any channel differs by more than the threshold
+	# (out of 255). Returns 0.0 for identical, up to 1.0 for fully different.
+	var w := a.get_width(); var h := a.get_height()
+	var diff := 0
+	var counted := 0
+	var ct := channel_threshold / 255.0
+	for y in h:
+		for x in w:
+			if not _pixel_unmasked(mask, x, y): continue
+			counted += 1
+			var ca := a.get_pixel(x, y)
+			var cb := b.get_pixel(x, y)
+			if absf(ca.r - cb.r) > ct or absf(ca.g - cb.g) > ct or absf(ca.b - cb.b) > ct:
+				diff += 1
+	if counted == 0: return 0.0
+	return float(diff) / float(counted)
+
+
+func _alg_ssim(a: Image, b: Image, mask: Image) -> float:
+	# Block-based SSIM on luminance — 8×8 non-overlapping blocks. Returns 1.0
+	# for identical images, decreasing toward 0 / negative for very different.
+	# Simplification vs the canonical 11×11 Gaussian — we use uniform 8×8
+	# windows which is ~2× faster and well-suited to pixel-art regression.
+	var w := a.get_width(); var h := a.get_height()
+	var blocks_x: int = w / SSIM_BLOCK
+	var blocks_y: int = h / SSIM_BLOCK
+	if blocks_x == 0 or blocks_y == 0: return _alg_mae(a, b, mask)  # tiny images
+	var sum_ssim := 0.0
+	var counted := 0
+	for by in blocks_y:
+		for bx in blocks_x:
+			var x0 := bx * SSIM_BLOCK
+			var y0 := by * SSIM_BLOCK
+			if not _block_unmasked(mask, x0, y0, SSIM_BLOCK): continue
+			var stats_a := _block_luma_stats(a, x0, y0)
+			var stats_b := _block_luma_stats(b, x0, y0)
+			var cov := _block_luma_cov(a, b, x0, y0, stats_a.mean, stats_b.mean)
+			var num := (2.0 * stats_a.mean * stats_b.mean + SSIM_C1) * (2.0 * cov + SSIM_C2)
+			var den := (stats_a.mean * stats_a.mean + stats_b.mean * stats_b.mean + SSIM_C1) \
+					 * (stats_a.var_ + stats_b.var_ + SSIM_C2)
+			if den == 0.0: continue
+			sum_ssim += num / den
+			counted += 1
+	if counted == 0: return 1.0
+	return sum_ssim / float(counted)
+
+
+func _block_luma_stats(img: Image, x0: int, y0: int) -> Dictionary:
+	# Rec. 601 luma weights × 255 (work in 0..255 space so c1/c2 land correctly).
+	var n := float(SSIM_BLOCK * SSIM_BLOCK)
+	var sum := 0.0
+	var sq_sum := 0.0
+	for y in range(y0, y0 + SSIM_BLOCK):
+		for x in range(x0, x0 + SSIM_BLOCK):
+			var c := img.get_pixel(x, y)
+			var l := (0.299 * c.r + 0.587 * c.g + 0.114 * c.b) * 255.0
+			sum += l
+			sq_sum += l * l
+	var mean := sum / n
+	var var_ := (sq_sum / n) - (mean * mean)
+	return {"mean": mean, "var_": var_}
+
+
+func _block_luma_cov(a: Image, b: Image, x0: int, y0: int, mean_a: float, mean_b: float) -> float:
+	var n := float(SSIM_BLOCK * SSIM_BLOCK)
+	var sum := 0.0
+	for y in range(y0, y0 + SSIM_BLOCK):
+		for x in range(x0, x0 + SSIM_BLOCK):
+			var ca := a.get_pixel(x, y)
+			var cb := b.get_pixel(x, y)
+			var la := (0.299 * ca.r + 0.587 * ca.g + 0.114 * ca.b) * 255.0
+			var lb := (0.299 * cb.r + 0.587 * cb.g + 0.114 * cb.b) * 255.0
+			sum += (la - mean_a) * (lb - mean_b)
+	return sum / n
+
+
+func _pixel_unmasked(mask: Image, x: int, y: int) -> bool:
+	if mask == null: return true
+	var c := mask.get_pixel(x, y)
+	# Excluded if pixel is fully black (per plan §10.2). We treat alpha=0 the
+	# same way so user can paint a transparent mask in a paint app.
+	return not (c.r < 0.05 and c.g < 0.05 and c.b < 0.05) and c.a > 0.05
+
+
+func _block_unmasked(mask: Image, x0: int, y0: int, size: int) -> bool:
+	if mask == null: return true
+	# Block is considered unmasked if ANY pixel in it is unmasked. Conservative
+	# — partial masks still contribute (a stricter alternative would require all
+	# pixels unmasked, but that throws away too much signal).
+	for y in range(y0, y0 + size):
+		for x in range(x0, x0 + size):
+			if _pixel_unmasked(mask, x, y):
+				return true
+	return false
+
+
+func _save_diff_viz(name: String, a: Image, b: Image, mask: Image) -> String:
+	# Pixel-difference visualization: max(|a-b|) per channel scaled ×4 for
+	# visibility, masked pixels rendered semi-transparent red.
+	var w := a.get_width(); var h := a.get_height()
+	var out := Image.create(w, h, false, Image.FORMAT_RGB8)
+	for y in h:
+		for x in w:
+			if not _pixel_unmasked(mask, x, y):
+				out.set_pixel(x, y, Color(0.4, 0.0, 0.0))
+				continue
+			var ca := a.get_pixel(x, y)
+			var cb := b.get_pixel(x, y)
+			var d := Color(
+				clampf(absf(ca.r - cb.r) * 4.0, 0.0, 1.0),
+				clampf(absf(ca.g - cb.g) * 4.0, 0.0, 1.0),
+				clampf(absf(ca.b - cb.b) * 4.0, 0.0, 1.0))
+			out.set_pixel(x, y, d)
+	_ensure_dir(CACHE_BASELINE_DIR)
+	var rel := "%sdiff_%s_%d.png" % [CACHE_BASELINE_DIR, name, Time.get_ticks_msec()]
+	var abs := ProjectSettings.globalize_path(rel)
+	out.save_png(abs)
+	return rel
+
+
+# =============================================================================
+# Baseline helpers
+# =============================================================================
+func _grab_viewport_image() -> Image:
+	var vp := get_viewport()
+	if vp == null: return null
+	return vp.get_texture().get_image()
+
+
+func _read_baseline_meta(name: String) -> Dictionary:
+	var rel := "%s%s.meta.json" % [CACHE_BASELINE_DIR, name]
+	var abs := ProjectSettings.globalize_path(rel)
+	if not FileAccess.file_exists(abs): return {}
+	var f := FileAccess.open(abs, FileAccess.READ)
+	if f == null: return {}
+	var txt := f.get_as_text()
+	f.close()
+	var parsed = JSON.parse_string(txt)
+	return parsed if parsed is Dictionary else {}
+
+
+func _list_baseline_names() -> Array:
+	var out: Array = []
+	var abs := ProjectSettings.globalize_path(CACHE_BASELINE_DIR)
+	if not DirAccess.dir_exists_absolute(abs): return out
+	var dir := DirAccess.open(abs)
+	if dir == null: return out
+	dir.list_dir_begin()
+	var f := dir.get_next()
+	while f != "":
+		if not dir.current_is_dir() and f.ends_with(".meta.json"):
+			out.append(f.substr(0, f.length() - ".meta.json".length()))
+		f = dir.get_next()
+	dir.list_dir_end()
+	return out
+
+
+func _default_threshold(algorithm: String) -> float:
+	# Direction of the test depends on the algorithm — see _passes_threshold.
+	match algorithm:
+		"mae":            return 0.02   # ≤ 2% mean absolute pixel error
+		"pixel_diff_pct": return 0.01   # ≤ 1% pixels differ noticeably
+		"ssim":           return 0.98   # ≥ 0.98 structural similarity
+		_:                return 0.98
+
+
+func _passes_threshold(algorithm: String, score: float, threshold: float) -> bool:
+	match algorithm:
+		"mae":            return score <= threshold
+		"pixel_diff_pct": return score <= threshold
+		"ssim":           return score >= threshold
+		_:                return score >= threshold
+
+
+func _load_image(rel_path: String) -> Image:
+	var abs := ProjectSettings.globalize_path(rel_path)
+	var img := Image.new()
+	if img.load(abs) != OK:
+		return null
+	return img
+
+
+func _image_from_b64(b64: String) -> Image:
+	var bytes := Marshalls.base64_to_raw(b64)
+	if bytes.is_empty(): return null
+	var img := Image.new()
+	if img.load_png_from_buffer(bytes) != OK:
+		return null
+	return img
+
+
+func _file_sha256(abs_path: String) -> String:
+	if not FileAccess.file_exists(abs_path): return ""
+	var h := HashingContext.new()
+	h.start(HashingContext.HASH_SHA256)
+	var f := FileAccess.open(abs_path, FileAccess.READ)
+	if f == null: return ""
+	while not f.eof_reached():
+		var chunk := f.get_buffer(65536)
+		if chunk.size() > 0: h.update(chunk)
+	f.close()
+	return h.finish().hex_encode()
+
+
+# =============================================================================
+# Common file helpers
+# =============================================================================
+func _is_safe_filename(name: String) -> bool:
+	# Match [A-Za-z0-9_.-]+, no leading dot. Guards against `../escape`,
+	# hidden-file weirdness, and JSON-key-collision via slashes.
+	if name.is_empty() or name.begins_with("."):
+		return false
+	for c in name:
+		var ch: int = c.unicode_at(0)
+		var ok := \
+			(ch >= 0x30 and ch <= 0x39) or \
+			(ch >= 0x41 and ch <= 0x5A) or \
+			(ch >= 0x61 and ch <= 0x7A) or \
+			ch == 0x2E or ch == 0x2D or ch == 0x5F  # . - _
+		if not ok: return false
+	return true
+
+
+func _write_json(rel_path: String, data: Dictionary) -> bool:
+	_ensure_dir(rel_path.get_base_dir() + "/")
+	var abs := ProjectSettings.globalize_path(rel_path)
+	var f := FileAccess.open(abs, FileAccess.WRITE)
+	if f == null: return false
+	f.store_string(JSON.stringify(data, "  "))
+	f.close()
+	return true
+
+
+func _ensure_dir(rel_dir: String) -> void:
+	var abs := ProjectSettings.globalize_path(rel_dir)
 	if not DirAccess.dir_exists_absolute(abs):
 		DirAccess.make_dir_recursive_absolute(abs)
+
+
+# =============================================================================
+func _ensure_cache_dir() -> void:
+	_ensure_dir(CACHE_SCREENSHOT_DIR)
 
 
 func _send(msg: Dictionary) -> void:

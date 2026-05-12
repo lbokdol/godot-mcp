@@ -512,6 +512,213 @@ export const runtimeTools: ToolDefinition[] = [
       required: ['parent_path', 'type'],
     },
   },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2 — Property bag snapshots (godot_ai_test_planning.md §10.1)
+  //
+  // A snapshot is a named JSON record of (node_path → {property → value}) for
+  // a caller-defined slice of the live scene. Use snapshots to diff state
+  // before/after an input sequence ("did anything change that I didn't
+  // expect?") or to restore a known-good state at the start of every test.
+  //
+  // Storage: res://addons/godot_mcp/cache/snapshots/<name>.json — durable
+  // across game restarts. In-memory cache is a thin layer above that.
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    name: 'snapshot_capture',
+    description:
+      "Capture a named snapshot of selected nodes' selected properties.\n\n" +
+      "USE WHEN: You want a reusable 'known state' to diff against later — e.g. before opening a menu, after a save-load round-trip.\n" +
+      "DO NOT USE WHEN: You only need one value — get_node_property is lighter.\n" +
+      "COMMON FAILURE: name with slashes or unicode → rejected. Use [A-Za-z0-9_.-]+.\n" +
+      "EXAMPLE: snapshot_capture(name='before_menu', node_paths=['/root/Main/Player','/root/Main/UI'], properties=['position','visible','modulate'])",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:             { type: 'string', description: 'Identifier for this snapshot. Allowed: [A-Za-z0-9_.-]+. Overwrites if present.' },
+        node_paths:       { type: 'array', items: { type: 'string' }, description: 'Nodes to capture. At least one required.' },
+        properties:       { type: 'array', items: { type: 'string' }, description: "Properties to capture per node. Default ['position','global_position','rotation','scale','visible','modulate']." },
+        include_children: { type: 'boolean', default: false, description: 'Recursively capture descendants of each node.' },
+      },
+      required: ['name', 'node_paths'],
+    },
+  },
+  {
+    name: 'snapshot_restore',
+    description:
+      "Restore a previously-captured snapshot by writing each recorded property back to its node.\n\n" +
+      "USE WHEN: Resetting state at the start of a new test scenario, undoing a destructive call_node_method.\n" +
+      "DO NOT USE WHEN: The snapshot is stale (entities renamed or deleted) — partial restore returns missing_nodes.\n" +
+      "COMMON FAILURE: SNAPSHOT_NOT_FOUND with suggestions=available names. Run snapshot_list first.\n" +
+      "EXAMPLE: snapshot_restore(name='before_menu') → { restored_assignments: 12, missing_nodes: [] }",
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'snapshot_diff',
+    description:
+      "Diff two snapshots by name and return changed / added / removed properties.\n\n" +
+      "USE WHEN: Asserting that an action only changed what you expected (turn-based: compare snapshot_before to snapshot_after).\n" +
+      "DO NOT USE WHEN: Visual regression is the goal — use compare_with_baseline.\n" +
+      "COMMON FAILURE: identical=true when expecting changes → check that node_paths overlap between the two snapshots.\n" +
+      "EXAMPLE: snapshot_diff(name_a='before_menu', name_b='after_menu') → { change_count: 3, changes: [...], identical: false }",
+    inputSchema: {
+      type: 'object',
+      properties: { name_a: { type: 'string' }, name_b: { type: 'string' } },
+      required: ['name_a', 'name_b'],
+    },
+  },
+  {
+    name: 'snapshot_list',
+    description:
+      "List all stored snapshot names.\n\n" +
+      "USE WHEN: Discovering snapshots after a fresh session restart.\n" +
+      "DO NOT USE WHEN: You only just captured a snapshot — its name is what you passed.\n" +
+      "COMMON FAILURE: None.\n" +
+      "EXAMPLE: snapshot_list() → { snapshots: ['before_menu', 'after_menu'], count: 2 }",
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2 — Visual regression baselines (§10.2)
+  //
+  // capture_baseline / compare_with_baseline / update_baseline / update_mask
+  // / list_baselines / delete_baseline / compare_screenshots_adhoc.
+  //
+  // Storage: res://addons/godot_mcp/cache/baseline/<name>.{png,mask.png,meta.json}
+  //
+  // Algorithms ('algorithm' arg):
+  //   - 'ssim'           — block-based 8×8 SSIM on luminance.
+  //                        Returns ≥0..1; higher = closer. Default threshold 0.98.
+  //   - 'mae'            — mean absolute pixel error.
+  //                        Returns ≥0..1; LOWER = closer. Default threshold 0.02.
+  //   - 'pixel_diff_pct' — fraction of pixels where any channel diff > 8/255.
+  //                        Returns ≥0..1; LOWER = closer. Default threshold 0.01.
+  //
+  // Mask convention: a PNG sibling at <name>.mask.png. Pixels that are FULLY
+  // BLACK (r<0.05 && g<0.05 && b<0.05) OR transparent are excluded from
+  // comparison. White / colored pixels are compared. Use update_mask(region=…)
+  // to paint a rect as masked.
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    name: 'capture_baseline',
+    description:
+      "Snapshot the current viewport as a named baseline image (.png + .meta.json).\n\n" +
+      "USE WHEN: First time recording a scene's expected appearance. Subsequent runs use compare_with_baseline against this.\n" +
+      "DO NOT USE WHEN: You want to OVERWRITE an existing baseline intentionally — use update_baseline so the intent is recorded.\n" +
+      "COMMON FAILURE: RENDERING_REQUIRED if no viewport (game not running). Run run_scene with wait_for_runtime first.\n" +
+      "EXAMPLE: capture_baseline(name='main_menu', algorithm='ssim', threshold=0.98)",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:      { type: 'string', description: 'Identifier. Allowed: [A-Za-z0-9_.-]+.' },
+        algorithm: { type: 'string', enum: ['ssim', 'mae', 'pixel_diff_pct'], default: 'ssim' },
+        threshold: { type: 'number', description: 'Pass/fail boundary. Direction depends on algorithm — SSIM is "≥ threshold", MAE/pixel_diff_pct are "≤ threshold".' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'compare_with_baseline',
+    description:
+      "Take a fresh viewport screenshot and compare it to a stored baseline using SSIM / MAE / pixel_diff_pct.\n\n" +
+      "USE WHEN: Smoke test gating after a scene/UI change to confirm rendering is still bit-similar.\n" +
+      "DO NOT USE WHEN: You're still authoring the scene — false positives every save. Save baseline AFTER you're happy.\n" +
+      "COMMON FAILURE: SIZE_MISMATCH if viewport changed dimensions — re-capture or resize. Excessive false positives mean you need update_mask to ignore noisy regions.\n" +
+      "EXAMPLE: compare_with_baseline(name='main_menu')",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:      { type: 'string' },
+        algorithm: { type: 'string', enum: ['ssim', 'mae', 'pixel_diff_pct'], description: 'Defaults to whatever capture_baseline saved.' },
+        threshold: { type: 'number', description: 'Override the saved threshold. Direction depends on algorithm.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'update_baseline',
+    description:
+      "Overwrite an existing baseline with the current viewport.\n\n" +
+      "USE WHEN: Intentional visual change to a scene — you reviewed the diff and accept it as the new ground truth.\n" +
+      "DO NOT USE WHEN: An unexpected regression — investigate the cause first; update_baseline silently makes the bug invisible.\n" +
+      "COMMON FAILURE: Same as capture_baseline.\n" +
+      "EXAMPLE: update_baseline(name='main_menu') after a deliberate theme change.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:      { type: 'string' },
+        algorithm: { type: 'string', enum: ['ssim', 'mae', 'pixel_diff_pct'], default: 'ssim' },
+        threshold: { type: 'number' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'update_mask',
+    description:
+      "Paint a rectangular region of the baseline's mask as EXCLUDED (or clear the mask).\n\n" +
+      "USE WHEN: A noisy region (animated clock, particle FX, dynamic timestamp) keeps tripping compare_with_baseline.\n" +
+      "DO NOT USE WHEN: The whole image fails — fix the regression instead of hiding it.\n" +
+      "COMMON FAILURE: BASELINE_NOT_FOUND. Capture the baseline first.\n" +
+      "EXAMPLE: update_mask(name='main_menu', region={x:0, y:0, w:120, h:32})  → masks the top-left HUD clock",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:   { type: 'string' },
+        region: { type: 'object', description: 'Rectangle to mask out as { x, y, w, h } in pixels. Omit when clear=true.',
+          properties: { x: { type: 'number' }, y: { type: 'number' }, w: { type: 'number' }, h: { type: 'number' } } },
+        clear:  { type: 'boolean', default: false, description: 'Reset the mask to fully-included (all-white) before applying region.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'list_baselines',
+    description:
+      "List all stored baseline names along with their algorithm / threshold / last comparison result.\n\n" +
+      "USE WHEN: Auditing visual regression coverage, deciding which baselines need refresh.\n" +
+      "DO NOT USE WHEN: You only need one baseline's details — read its meta.json directly via Read tool.\n" +
+      "COMMON FAILURE: None.\n" +
+      "EXAMPLE: list_baselines() → { baselines: [{name, algorithm, threshold, last_score, last_pass}, ...] }",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'delete_baseline',
+    description:
+      "Remove a baseline and its mask + meta.\n\n" +
+      "USE WHEN: A scene was renamed or deleted — clean up stale baselines.\n" +
+      "DO NOT USE WHEN: You want to RESET the baseline — use update_baseline.\n" +
+      "COMMON FAILURE: BASELINE_NOT_FOUND if already removed.\n" +
+      "EXAMPLE: delete_baseline(name='main_menu')",
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'compare_screenshots_adhoc',
+    description:
+      "Compare two base64-encoded PNGs without touching any baseline storage.\n\n" +
+      "USE WHEN: One-shot comparison (before-vs-after) where persisting a baseline isn't worth it.\n" +
+      "DO NOT USE WHEN: You'll want to re-run this check — use capture_baseline / compare_with_baseline so the baseline is named and discoverable.\n" +
+      "COMMON FAILURE: SIZE_MISMATCH if the two screenshots aren't the same dimensions.\n" +
+      "EXAMPLE: compare_screenshots_adhoc(a_b64=…, b_b64=…, algorithm='ssim', threshold=0.95)",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        a_b64:     { type: 'string', description: 'Base64-encoded PNG.' },
+        b_b64:     { type: 'string', description: 'Base64-encoded PNG.' },
+        algorithm: { type: 'string', enum: ['ssim', 'mae', 'pixel_diff_pct'], default: 'ssim' },
+        threshold: { type: 'number' },
+      },
+      required: ['a_b64', 'b_b64'],
+    },
+  },
 ];
 
 /**

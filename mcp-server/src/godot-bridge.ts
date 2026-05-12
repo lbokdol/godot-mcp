@@ -61,6 +61,11 @@ export const RUNTIME_ONLY_TOOLS = new Set<string>([
   'get_debug_log', 'clear_debug_log', 'get_print_log',
   // §7.10
   'set_node_property', 'call_node_method', 'add_node_runtime',
+  // Phase 2 §10.1 — Property bag snapshots
+  'snapshot_capture', 'snapshot_restore', 'snapshot_diff', 'snapshot_list',
+  // Phase 2 §10.2 — Visual regression baselines
+  'capture_baseline', 'compare_with_baseline', 'update_baseline', 'update_mask',
+  'list_baselines', 'delete_baseline', 'compare_screenshots_adhoc',
 ]);
 
 interface PendingRequest {
